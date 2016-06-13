@@ -1,19 +1,75 @@
 package org.derekmorr
 
-import akka.actor.{Actor, ActorLogging, ActorRef, Props}
+import scala.concurrent.duration._
+import scala.language.postfixOps
+import akka.actor.{Actor, ActorLogging, ActorRef, Cancellable, Props}
+import akka.event.LoggingReceive
 import akka.util.Timeout
-import org.derekmorr.WorkerActor.ProcessRequest
+import org.derekmorr.DbActor.{DBResponse, GetResource}
+import org.derekmorr.WorkerActor.{DBTimeout, ProcessRequest, WorkerResponse}
 
 
 /**
- * Worker Actor to process a request
- */
+  * Worker Actor to process a request
+  */
 class WorkerActor(dbActor: ActorRef, slaTimeout: Timeout) extends Actor with ActorLogging {
 
-  override def receive = {
-    case ProcessRequest(queryId) => ???
+  // give us some breathing room to do our work
+  val breathingRoom = 50 milliseconds
+
+  val backendTimeout = Timeout(slaTimeout.duration - breathingRoom)
+
+  var timeoutHandleOption: Option[Cancellable] = None
+  var queryIdOption: Option[String] = None
+  var destinationOption: Option[ActorRef] = None
+
+  override def receive = LoggingReceive {
+    case ProcessRequest(queryId)        => processRequest(queryId, sender())
+    case DBTimeout                      => handleTimeout()
+    case DBResponse(queryId, response)  => handleSuccess(response)
   }
-  
+
+  private def processRequest(queryId: String, target: ActorRef) = {
+
+    queryIdOption = Option(queryId)
+    destinationOption = Option(target)
+
+    // tell the database actor to run the query
+    dbActor ! GetResource(queryId)
+
+    // the database might not respond in time (or at all)
+    // so schedule a message to ourself to handle the timeout
+    import context.dispatcher
+    val timeoutId = context.system.scheduler.scheduleOnce(backendTimeout.duration) {
+      self ! DBTimeout
+    }
+
+    timeoutHandleOption = Option(timeoutId)
+  }
+
+  private def handleSuccess(response: Option[String]) = {
+    for {
+      destination   <- destinationOption
+      queryId       <- queryIdOption
+      timeoutHandle <- timeoutHandleOption
+    } yield {
+      destination ! WorkerResponse(queryId, response)
+
+      // cancel the timeout message
+      timeoutHandle.cancel()
+    }
+  }
+
+  private def handleTimeout() = {
+    for {
+      destination <- destinationOption
+      queryId     <- queryIdOption
+    } yield {
+      log.error(s"failed to get a response within $backendTimeout ; sending default msg to $destination")
+      destination ! WorkerResponse(queryId, None)
+    }
+  }
+
 }
 
 object WorkerActor {
@@ -23,4 +79,7 @@ object WorkerActor {
 
   case class ProcessRequest(queryId: String)
   case class WorkerResponse(queryId: String, response: Option[String])
+
+  /** Message indicating that the database timed out */
+  case object DBTimeout
 }
