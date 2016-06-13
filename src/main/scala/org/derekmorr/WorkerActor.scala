@@ -20,18 +20,16 @@ class WorkerActor(dbActor: ActorRef, slaTimeout: Timeout) extends Actor with Act
   val backendTimeout = Timeout(slaTimeout.duration - breathingRoom)
 
   var timeoutHandleOption: Option[Cancellable] = None
-  var queryIdOption: Option[String] = None
   var destinationOption: Option[ActorRef] = None
 
   override def receive = LoggingReceive {
     case ProcessRequest(queryId)        => processRequest(queryId, sender())
-    case DBTimeout                      => handleTimeout()
-    case DBResponse(queryId, response)  => handleSuccess(response)
+    case DBTimeout(queryId)             => handleTimeout(queryId)
+    case DBResponse(queryId, response)  => handleSuccess(queryId, response)
   }
 
   private def processRequest(queryId: String, target: ActorRef) = {
 
-    queryIdOption = Option(queryId)
     destinationOption = Option(target)
 
     // tell the database actor to run the query
@@ -41,16 +39,15 @@ class WorkerActor(dbActor: ActorRef, slaTimeout: Timeout) extends Actor with Act
     // so schedule a message to ourself to handle the timeout
     import context.dispatcher
     val timeoutId = context.system.scheduler.scheduleOnce(backendTimeout.duration) {
-      self ! DBTimeout
+      self ! DBTimeout(queryId)
     }
 
     timeoutHandleOption = Option(timeoutId)
   }
 
-  private def handleSuccess(response: Option[String]) = {
+  private def handleSuccess(queryId: String, response: Option[String]) = {
     for {
       destination   <- destinationOption
-      queryId       <- queryIdOption
       timeoutHandle <- timeoutHandleOption
     } yield {
       destination ! WorkerResponse(queryId, response)
@@ -60,10 +57,9 @@ class WorkerActor(dbActor: ActorRef, slaTimeout: Timeout) extends Actor with Act
     }
   }
 
-  private def handleTimeout() = {
+  private def handleTimeout(queryId: String) = {
     for {
       destination <- destinationOption
-      queryId     <- queryIdOption
     } yield {
       log.error(s"failed to get a response within $backendTimeout ; sending default msg to $destination")
       destination ! WorkerResponse(queryId, None)
@@ -81,5 +77,5 @@ object WorkerActor {
   case class WorkerResponse(queryId: String, response: Option[String])
 
   /** Message indicating that the database timed out */
-  case object DBTimeout
+  case class DBTimeout(queryId: String)
 }
